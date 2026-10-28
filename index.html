@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#101010">
+<link rel="preconnect" href="https://yahooproxy.b864v27974.workers.dev" crossorigin>
+<title>Top-Down Candle Panel</title>
+<style>
+html,body{margin:0;background:#101010;color:#e8e8e8;font-family:-apple-system,system-ui,sans-serif}
+#wrap{max-width:560px;margin:0 auto;padding:calc(6px + env(safe-area-inset-top,0px)) 8px calc(8px + env(safe-area-inset-bottom,0px))}
+svg{display:block;width:100%;height:auto}
+#st{font-size:10px;color:#8a8a8a;margin-top:4px;font-variant-numeric:tabular-nums}
+#st.err{color:#ffb74d}
+#tbl{margin-top:10px;font-size:11px;font-variant-numeric:tabular-nums}
+#tbl .cap{color:#8a8a8a;font-size:10px;margin:0 0 4px;line-height:1.25}
+#tbl table{width:100%;border-collapse:collapse}
+#tbl th{color:#8a8a8a;font-weight:500;text-align:left;border-bottom:1px solid #333;padding:2px 3px}
+#tbl td{padding:2px 3px;border-bottom:1px solid #1d1d1d;white-space:nowrap}
+#tbl th:last-child,#tbl td:last-child{text-align:right}
+.g{color:#3ddc84}.r{color:#ff5252}.a{color:#ffb74d}.n{color:#c4c4c4}
+</style>
+</head>
+<body>
+<div id="wrap">
+<div id="chart"></div>
+<div id="tbl"></div>
+<div id="st">Caricamento…</div>
+</div>
+<script>
+// Versione HTML di «Top-Down Candle Panel»: candele 5M, 15M, 1H, 4H affiancate, scalate attorno al prezzo attuale (linea blu),
+// con lettura della candela e tratteggio sul minimo raggiunto da 1H e 4H.
+// Dati: 1 minuto Yahoo (7 giorni) tramite il Worker, aggregati qui. Simbolo: ?s=QQQ (esempio: ?s=NQ%3DF per il future Nasdaq).
+const PROXY='https://yahooproxy.b864v27974.workers.dev';
+const SYMBOL=(new URLSearchParams(location.search).get('s')||'QQQ').toUpperCase();
+const REFRESH=15, SESSION_OPEN=570; // 09:30 ora di New York, in minuti dalla mezzanotte
+// Scale come nello script Pine (modalità Hybrid / Midpoint): ogni candela è centrata sul prezzo attuale e ingrandita
+const TFS=[
+ {m:5,  label:'5M',  scale:14.5},
+ {m:15, label:'15M', scale:12.5},
+ {m:60, label:'1H',  scale:8.0, low:'#00bcd4'},
+ {m:240,label:'4H',  scale:2.5, low:'#b388ff'}
+];
+const BULL='#00c89b', BEAR='#f23645', AMBER='#ffb100', BLUE='#2962ff', WICK='#9a9a9a';
+
+// ---------- dati ----------
+let urlOrder=[0,1,2], ctrl=null, timer=null;
+async function getBars(signal){
+ const path='/v8/finance/chart/'+encodeURIComponent(SYMBOL)+'?interval=1m&range=7d';
+ const urls=[PROXY+path,PROXY+'/?url='+encodeURIComponent('https://query1.finance.yahoo.com'+path),PROXY+'/?symbol='+encodeURIComponent(SYMBOL)+'&interval=1m&range=7d'];
+ let lastErr;
+ for(const i of urlOrder){
+  const ac=new AbortController(),onAbort=()=>ac.abort(),to=setTimeout(()=>ac.abort(),10000);
+  signal.addEventListener('abort',onAbort);
+  try{
+   const res=await fetch(urls[i],{cache:'no-store',signal:ac.signal});if(!res.ok)throw Error('HTTP '+res.status);
+   const data=await res.json();if(data?.chart?.error)throw Error(data.chart.error.description||'errore Yahoo');
+   const result=data?.chart?.result?.[0]||data?.result?.[0]||data;
+   const q=result?.indicators?.quote?.[0],ts=result?.timestamp;
+   if(!q||!ts)throw Error('Formato dati non riconosciuto');
+   const bars=[];
+   for(let k=0;k<ts.length;k++){
+    if(![q.open?.[k],q.high?.[k],q.low?.[k],q.close?.[k],ts[k]].every(Number.isFinite)||q.high[k]<q.low[k])continue;
+    bars.push({time:ts[k]*1000,open:q.open[k],high:q.high[k],low:q.low[k],close:q.close[k]});
+   }
+   bars.sort((a,b)=>a.time-b.time);for(let k=bars.length-1;k>0;k--)if(bars[k].time===bars[k-1].time)bars.splice(k,1);
+   // ultimo prezzo di Yahoo: aggiorna la candela in corso o crea quella nuova
+   const mt=result?.meta?.regularMarketTime*1000,mp=result?.meta?.regularMarketPrice;
+   if(bars.length&&Number.isFinite(mt)&&Number.isFinite(mp)){
+    const slot=Math.floor(mt/6e4)*6e4,last=bars[bars.length-1];
+    if(last.time===slot&&mt>=last.time){last.close=mp;last.high=Math.max(last.high,mp);last.low=Math.min(last.low,mp)}
+    else if(slot>last.time&&slot<=Date.now())bars.push({time:slot,open:mp,high:mp,low:mp,close:mp});
+   }
+   if(bars.length<10)throw Error('poche candele');
+   urlOrder=[i,...urlOrder.filter(x=>x!==i)];
+   return bars;
+  }catch(e){
+   if(signal.aborted)throw e;
+   lastErr=e.name==='AbortError'?Error('nessuna risposta entro 10 secondi'):e;
+  }finally{clearTimeout(to);signal.removeEventListener('abort',onAbort)}
+ }
+ throw lastErr||Error('Impossibile caricare i dati');
+}
+
+// ---------- aggregazione (ancorata alle 09:30 di New York, come le candele 1H/4H di TradingView sulle azioni USA) ----------
+const NYF=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
+function nyParts(t){const p={};for(const x of NYF.formatToParts(new Date(t)))p[x.type]=x.value;return {d:p.year+p.month+p.day,m:(+p.hour)*60+(+p.minute)}}
+function aggregate(bars,N){
+ const out=[];let key=null,cur=null;
+ for(const b of bars){
+  const k=b.ny||(b.ny=nyParts(b.time)),kk=k.d+':'+Math.floor((k.m-SESSION_OPEN)/N);
+  if(kk!==key){key=kk;cur={time:b.time,open:b.open,high:b.high,low:b.low,close:b.close};out.push(cur)}
+  else{if(b.high>cur.high)cur.high=b.high;if(b.low<cur.low)cur.low=b.low;cur.close=b.close}
+ }
+ return out;
+}
+
+// ---------- lettura candela (stessa logica dello script Pine) ----------
+function candleRead(c){
+ const rng=Math.max(c.high-c.low,1e-9),body=Math.abs(c.close-c.open),
+  up=c.high-Math.max(c.open,c.close),lo=Math.min(c.open,c.close)-c.low,
+  bp=body/rng,upP=up/rng,loP=lo/rng,bull=c.close>=c.open;
+ if(bp<=0.15)return ['Doji'];
+ if(upP>=0.40&&upP>loP)return ['Upper','Rejection'];
+ if(loP>=0.40&&loP>upP)return ['Lower','Rejection'];
+ if(bp>=0.55)return bull?['Bullish','Expansion']:['Bearish','Expansion'];
+ return [bull?'Bullish':'Bearish'];
+}
+function readColor(lines,bull){return lines[0]==='Doji'||lines[1]==='Rejection'?AMBER:bull?BULL:BEAR}
+
+// ---------- disegno ----------
+const fmtN=(v)=>v.toLocaleString('it-IT',{minimumFractionDigits:v>=1000?1:2,maximumFractionDigits:v>=1000?1:2});
+function buildSvg(cs,cur){
+ const W=380,H=430,L=8,R=70,padT=34,padB=40,bw=11;
+ // prezzo "da schermo": ogni candela è centrata sul prezzo attuale e ingrandita (anchor = punto medio)
+ const D=cs.map(c=>{const mid=(c.high+c.low)/2,f=p=>cur+(p-mid)*c.scale;return {c,so:f(c.open),sh:f(c.high),sl:f(c.low),sc:f(c.close)}});
+ let mx=cur,mn=cur;for(const d of D){if(d.sh>mx)mx=d.sh;if(d.sl<mn)mn=d.sl}
+ if(mx-mn<1e-9){mx+=1;mn-=1}
+ const k=(H-padT-padB)/(mx-mn),y=v=>padT+(mx-v)*k,slotW=(W-L-R)/D.length;
+ const yc=y(cur);
+ let s='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Candele 5M 15M 1H 4H di '+SYMBOL+'" font-family="-apple-system,system-ui,sans-serif">';
+ s+='<rect width="'+W+'" height="'+H+'" fill="#101010"/>';
+ // minimo e massimo di 1H e 4H: tratteggio che attraversa tutto il pannello; le etichette evitano di sovrapporsi tra loro e al prezzo
+ const taken=[yc],lows=[];
+ D.forEach(d=>{if(!d.c.low_col)return;
+  lows.push({d,k:'min',p:d.c.low,ly:y(d.sl)},{d,k:'max',p:d.c.high,ly:y(d.sh)})});
+ lows.sort((a,b)=>a.ly-b.ly);
+ for(const o of lows){let lab=o.ly;
+  for(let it=0;it<8;it++){const t=taken.find(v=>Math.abs(lab-v)<22);if(t===undefined)break;lab=lab>=t?t+22:t-22}
+  taken.push(lab);o.lab=lab}
+ for(const o of lows){
+  s+='<line x1="'+L+'" x2="'+(W-R+4)+'" y1="'+o.ly.toFixed(1)+'" y2="'+o.ly.toFixed(1)+'" stroke="'+o.d.c.low_col+'" stroke-width="1.2" stroke-dasharray="5 4"/>';
+ }
+ // linea blu del prezzo attuale
+ s+='<line x1="'+L+'" x2="'+(W-2)+'" y1="'+yc.toFixed(1)+'" y2="'+yc.toFixed(1)+'" stroke="'+BLUE+'" stroke-width="1" stroke-dasharray="1.5 3"/>';
+ D.forEach((d,i)=>{
+  const c=d.c,cx=L+slotW*(i+.5),bull=c.close>=c.open,col=bull?BULL:BEAR,
+   top=y(Math.max(d.so,d.sc)),bot=y(Math.min(d.so,d.sc)),h=Math.max(1.5,bot-top);
+  s+='<line x1="'+cx.toFixed(1)+'" x2="'+cx.toFixed(1)+'" y1="'+y(d.sh).toFixed(1)+'" y2="'+y(d.sl).toFixed(1)+'" stroke="'+WICK+'" stroke-width="1"/>';
+  s+='<rect x="'+(cx-bw).toFixed(1)+'" y="'+top.toFixed(1)+'" width="'+(bw*2)+'" height="'+h.toFixed(1)+'" fill="'+col+'"/>';
+  // etichetta del timeframe sopra il massimo
+  const ty=y(d.sh)-24,tw=c.label.length>2?36:30;
+  s+='<path d="M'+(cx-tw/2).toFixed(1)+','+ty.toFixed(1)+'h'+tw+'v16h-'+(tw/2-4)+'l-4,4l-4,-4h-'+(tw/2-4)+'z" fill="#1e222d"/>';
+  s+='<text x="'+cx.toFixed(1)+'" y="'+(ty+12).toFixed(1)+'" text-anchor="middle" font-size="11" fill="#fff">'+c.label+'</text>';
+  // lettura sotto il minimo
+  const rd=candleRead(c),rc=readColor(rd,bull);
+  rd.forEach((t,j)=>{s+='<text x="'+cx.toFixed(1)+'" y="'+(y(d.sl)+13+j*12).toFixed(1)+'" text-anchor="middle" font-size="10.5" fill="'+rc+'">'+t+'</text>'});
+ });
+ // etichette di minimo e massimo (a destra) e tag del prezzo attuale
+ for(const o of lows){
+  s+='<text x="'+(W-R+8)+'" y="'+(o.lab-1).toFixed(1)+'" font-size="9.5" fill="'+o.d.c.low_col+'">'+o.d.c.label+' '+o.k+'</text>';
+  s+='<text x="'+(W-R+8)+'" y="'+(o.lab+10).toFixed(1)+'" font-size="9.5" fill="'+o.d.c.low_col+'">'+fmtN(o.p)+'</text>';
+ }
+ s+='<rect x="'+(W-R+4)+'" y="'+(yc-8).toFixed(1)+'" width="'+(R-6)+'" height="16" rx="3" fill="'+BLUE+'"/>';
+ s+='<text x="'+(W-R+4+(R-6)/2)+'" y="'+(yc+4).toFixed(1)+'" text-anchor="middle" font-size="10.5" font-weight="600" fill="#fff">'+fmtN(cur)+'</text>';
+ return s+'</svg>';
+}
+
+// ---------- MACD 12·26·9 a 1 minuto: solo tabella «ragione / torto» ----------
+// Incrocio su candele CHIUSE; ingresso = chiusura della candela dell'incrocio; uscita = chiusura dell'incrocio opposto della stessa seduta,
+// oppure l'ultima candela della seduta; se la seduta è ancora aperta l'esito è «In corso» (prezzo attuale). % positiva = a favore del segnale.
+const TABLE_ROWS=10;
+function emaP(a,n){const k=2/(n+1),o=[];let e=a[0];for(let i=0;i<a.length;i++){e=i?a[i]*k+e*(1-k):a[0];o.push(e)}return o}
+function macdCrosses(bars){
+ const n=bars.length,forming=bars[n-1].time+6e4>Date.now(),m=forming?n-1:n,cl=bars.slice(0,m).map(b=>b.close),
+  f=emaP(cl,12),sl=emaP(cl,26),mac=f.map((v,i)=>v-sl[i]),sig=emaP(mac,9),X=[];
+ for(let i=60;i<m;i++){
+  const g=mac[i]>sig[i]&&mac[i-1]<=sig[i-1],d=mac[i]<sig[i]&&mac[i-1]>=sig[i-1];
+  if(g||d)X.push({i,side:g?'SU':'GIÙ'});
+ }
+ const day=bars.map(b=>(b.ny||(b.ny=nyParts(b.time))).d),dayLast={};bars.forEach((b,i)=>{dayLast[day[i]]=i});
+ return X.map((x,k)=>{
+  const dl=dayLast[day[x.i]],nx=X[k+1],end=nx&&nx.i<=dl&&day[nx.i]===day[x.i]?nx.i:dl,open=!(nx&&nx.i<=dl&&day[nx.i]===day[x.i])&&dl===n-1,
+   a=bars[x.i].close,b=bars[end].close,pct=(x.side==='SU'?b-a:a-b)/a*100;
+  return {time:bars[x.i].time,side:x.side,entry:a,exit:b,pct,open,res:open?'In corso':pct>0?'Ragione':pct<0?'Torto':'Pari'};
+ });
+}
+const pctF=(v)=>(v>0?'+':'')+v.toLocaleString('it-IT',{minimumFractionDigits:2,maximumFractionDigits:2})+'%';
+function buildTable(rows){
+ if(!rows.length)return '<div class="cap">MACD: nessun incrocio nei dati disponibili.</div>';
+ const done=rows.filter(r=>!r.open),ok=done.filter(r=>r.pct>0).length,ko=done.filter(r=>r.pct<0).length,
+  avg=done.length?done.reduce((t,r)=>t+r.pct,0)/done.length:0,
+  today=new Date().toLocaleDateString('it-IT',{timeZone:'Europe/Rome'});
+ let h='<div class="cap">MACD 12·26·9 a 1 min · '+done.length+' incroci conclusi negli ultimi 7 giorni: <span class="g">'+ok+' con ragione</span>, <span class="r">'+ko+' torto</span>, % media '+pctF(avg)
+  +'. Esito = dall\'incrocio al successivo opposto (o a fine seduta); % positiva = a favore del segnale.</div>'
+  +'<table><thead><tr><th>Ora</th><th>Segnale</th><th>Prezzo</th><th>Esito</th><th>%</th></tr></thead><tbody>';
+ for(const r of rows.slice(-TABLE_ROWS).reverse()){
+  const d=new Date(r.time),dd=d.toLocaleDateString('it-IT',{timeZone:'Europe/Rome'}),
+   t=(dd===today?'':d.toLocaleDateString('it-IT',{timeZone:'Europe/Rome',day:'2-digit',month:'2-digit'})+' ')+d.toLocaleTimeString('it-IT',{timeZone:'Europe/Rome',hour:'2-digit',minute:'2-digit'}),
+   rc=r.open?'a':r.pct>0?'g':r.pct<0?'r':'n';
+  h+='<tr><td>'+t+'</td><td class="'+(r.side==='SU'?'g':'r')+'">'+r.side+'</td><td>'+fmtN(r.entry)+'</td><td class="'+rc+'">'+r.res+'</td><td class="'+rc+'">'+pctF(r.pct)+'</td></tr>';
+ }
+ return h+'</tbody></table>';
+}
+
+// ---------- ciclo ----------
+const st=document.getElementById('st'),chart=document.getElementById('chart'),tbl=document.getElementById('tbl');
+function setStatus(t,err){st.textContent=t;st.className=err?'err':''}
+async function load(){
+ if(ctrl)ctrl.abort();const c=ctrl=new AbortController();
+ try{
+  const bars=await getBars(c.signal);
+  const cur=bars[bars.length-1].close;
+  const cs=TFS.map(t=>{const a=aggregate(bars,t.m),last=a[a.length-1];return {...last,label:t.label,scale:t.scale,low_col:t.low||null}});
+  chart.innerHTML=buildSvg(cs,cur);
+  try{tbl.innerHTML=buildTable(macdCrosses(bars))}catch(e){tbl.textContent=''}
+  const hm=new Date().toLocaleTimeString('it-IT',{timeZone:'Europe/Rome'});
+  setStatus(SYMBOL+' · aggiornato '+hm+' · candele in corso, ancorate alle 09:30 di New York');
+ }catch(e){
+  if(c.signal.aborted)return;
+  setStatus('Errore: '+(e&&e.message||e)+' — riprovo tra '+REFRESH+' s',true);
+ }finally{
+  if(ctrl===c&&!document.hidden){clearTimeout(timer);timer=setTimeout(load,REFRESH*1000)}
+ }
+}
+document.addEventListener('visibilitychange',()=>{if(document.hidden){if(ctrl)ctrl.abort();clearTimeout(timer)}else load()});
+load();
+</script>
+</body>
+</html>
